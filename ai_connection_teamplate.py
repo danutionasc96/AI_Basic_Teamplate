@@ -25,6 +25,12 @@ How Save works:
 - If you edited config.json on disk while the window was open, press
   Reload before Save, or those disk edits will be overwritten.
 
+How Test works:
+- Reads the four form fields. It does not write config.json.
+- Checks that key, URL, and model are not empty placeholders.
+- Asks the gateway if the configuration can connect. The UI stays
+  responsive while that request runs.
+
 How to continue:
 - Add widgets in SettingsWindow._build_ui(), after the connection group.
 - Call create_client() when later code needs to talk to the API.
@@ -38,7 +44,7 @@ import sys
 from pathlib import Path
 
 from openai import OpenAI
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -66,6 +72,9 @@ CONFIG_PATH = APP_DIR / "config.json"
 # shows the python.exe icon instead of the file named by window.icon.
 # Replace window.app_user_model_id in config.json when reusing the template.
 DEFAULT_APP_USER_MODEL_ID = "template.ai.connection"
+PLACEHOLDER_API_KEY = "YOUR_API_KEY"
+PLACEHOLDER_BASE_URL = "YOUR_BASE_URL"
+PLACEHOLDER_MODEL = "YOUR_AGENT_NAME"
 
 
 def load_config() -> dict:
@@ -175,13 +184,9 @@ def apply_taskbar_identity(config: dict) -> None:
 def create_client(settings: dict) -> OpenAI:
     """Build the API client from the connection dictionary.
 
-    This form does not call the API. Later code should call this function
-    when it needs to send a request. Pass load_config() or the dictionary
-    from SettingsWindow._collect().
-
+    Pass load_config() or the dictionary from SettingsWindow._collect().
     timeout_seconds is the maximum wait, in seconds, for one API response.
     If the server does not answer in time, the OpenAI library raises an error.
-    The form itself does not use this value.
     """
     return OpenAI(
         api_key=settings["api_key"],
@@ -190,11 +195,81 @@ def create_client(settings: dict) -> OpenAI:
     )
 
 
+def connection_problems(settings: dict) -> list[str]:
+    """Return local problems that make a connection test pointless."""
+    problems: list[str] = []
+    api_key = str(settings.get("api_key", "")).strip()
+    base_url = str(settings.get("base_url", "")).strip()
+    model = str(settings.get("model", "")).strip()
+    if not api_key or api_key == PLACEHOLDER_API_KEY:
+        problems.append("API key is missing.")
+    if not base_url or base_url == PLACEHOLDER_BASE_URL:
+        problems.append("Base URL is missing.")
+    if not model or model == PLACEHOLDER_MODEL:
+        problems.append("Model / agent is missing.")
+    return problems
+
+
+def test_connection(settings: dict) -> str:
+    """Try the current settings against the gateway.
+
+    First asks the server for its model list. That checks the URL and key
+    without sending a chat prompt. If the gateway has no model list, send
+    a one-token ping with the configured model instead.
+    """
+    problems = connection_problems(settings)
+    if problems:
+        raise ValueError(" ".join(problems))
+    client = create_client(settings)
+    model = str(settings["model"]).strip()
+    try:
+        page = client.models.list()
+    except Exception:
+        client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+        )
+        return f"Connected. Model {model} accepted a test request."
+    names = [
+        item.id
+        for item in getattr(page, "data", [])
+        if getattr(item, "id", None)
+    ]
+    if names and model not in names:
+        raise ValueError(
+            f"Connected to the server, but model {model} was not found."
+        )
+    if names:
+        return f"Connected. Model {model} is available."
+    return "Connected."
+
+
+class ConnectionTestWorker(QObject):
+    """Run test_connection() off the UI thread."""
+
+    succeeded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, settings: dict) -> None:
+        super().__init__()
+        self._settings = settings
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            message = test_connection(self._settings)
+        except Exception as extra:
+            self.failed.emit(str(extra))
+            return
+        self.succeeded.emit(message)
+
+
 class SettingsWindow(QMainWindow):
     """The application window.
 
-    The top group is the connection form. Reload and Save stay inside it
-    so they do not slide to the bottom when the window grows.
+    The top group is the connection form. Reload, Save, and Test stay
+    inside it so they do not slide to the bottom when the window grows.
     Add later UI under that group in _build_ui(), above the empty stretch.
     """
 
@@ -202,10 +277,12 @@ class SettingsWindow(QMainWindow):
         super().__init__()
         self.config_data = load_config()
         window = window_settings(self.config_data)
+        self._test_thread: QThread | None = None
+        self._test_worker: ConnectionTestWorker | None = None
 
         self._apply_application_name()
-        self.resize(int(window.get("width", 480)), int(window.get("height", 320)))
-        self.setMinimumSize(420, 280)
+        self.resize(int(window.get("width", 520)), int(window.get("height", 340)))
+        self.setMinimumSize(460, 300)
 
         self._build_ui()
         self._fill_from_config()
@@ -223,7 +300,7 @@ class SettingsWindow(QMainWindow):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        # Keep fields, Reload, and Save inside this one group.
+        # Keep fields, Reload, Save, and Test inside this one group.
         # New interface code belongs after root.addWidget(connection), not here.
         connection = QGroupBox("AI Connection")
         connection_layout = QVBoxLayout(connection)
@@ -237,7 +314,7 @@ class SettingsWindow(QMainWindow):
 
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_edit.setPlaceholderText("YOUR_API_KEY")
+        self.api_key_edit.setPlaceholderText(PLACEHOLDER_API_KEY)
         form.addRow("API key", self.api_key_edit)
 
         self.show_key_check = QCheckBox("Show key")
@@ -245,14 +322,14 @@ class SettingsWindow(QMainWindow):
         form.addRow("", self.show_key_check)
 
         self.base_url_edit = QLineEdit()
-        self.base_url_edit.setPlaceholderText("YOUR_BASE_URL")
+        self.base_url_edit.setPlaceholderText(PLACEHOLDER_BASE_URL)
         form.addRow("Base URL", self.base_url_edit)
 
         self.model_edit = QLineEdit()
-        self.model_edit.setPlaceholderText("YOUR_AGENT_NAME")
+        self.model_edit.setPlaceholderText(PLACEHOLDER_MODEL)
         form.addRow("Model / agent", self.model_edit)
 
-        # Saved as timeout_seconds. Used only by create_client(), not by this form.
+        # Saved as timeout_seconds. Used by create_client() and by Test.
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(1, 3600)
         self.timeout_spin.setSuffix(" s")
@@ -266,8 +343,11 @@ class SettingsWindow(QMainWindow):
         self.save_btn = QPushButton("Save")
         self.save_btn.setDefault(True)
         self.save_btn.clicked.connect(self._save)
+        self.test_btn = QPushButton("Test")
+        self.test_btn.clicked.connect(self._test)
         button_row.addWidget(self.reload_btn)
         button_row.addWidget(self.save_btn)
+        button_row.addWidget(self.test_btn)
         connection_layout.addLayout(button_row)
         root.addWidget(connection)
 
@@ -340,6 +420,58 @@ class SettingsWindow(QMainWindow):
         self._apply_application_name()
         self.statusBar().showMessage(f"Reloaded {CONFIG_PATH.name}.")
 
+    def _test(self) -> None:
+        """Check the form values against the gateway without saving."""
+        if self._test_thread is not None and self._test_thread.isRunning():
+            self.statusBar().showMessage("Connection test already running.")
+            return
+        settings = self._collect()
+        problems = connection_problems(settings)
+        if problems:
+            message = " ".join(problems)
+            self.statusBar().showMessage(message)
+            QMessageBox.warning(self, "Test", message)
+            return
+        self._set_test_busy(True)
+        self.statusBar().showMessage("Testing connection…")
+        self._test_thread = QThread(self)
+        self._test_worker = ConnectionTestWorker(settings)
+        self._test_worker.moveToThread(self._test_thread)
+        self._test_thread.started.connect(self._test_worker.run)
+        self._test_worker.succeeded.connect(self._on_test_ok)
+        self._test_worker.failed.connect(self._on_test_failed)
+        self._test_worker.succeeded.connect(self._test_thread.quit)
+        self._test_worker.failed.connect(self._test_thread.quit)
+        self._test_thread.finished.connect(self._cleanup_test_worker)
+        self._test_thread.start()
+
+    def _set_test_busy(self, busy: bool) -> None:
+        self.test_btn.setEnabled(not busy)
+        self.save_btn.setEnabled(not busy)
+        self.reload_btn.setEnabled(not busy)
+
+    @Slot(str)
+    def _on_test_ok(self, message: str) -> None:
+        self._set_test_busy(False)
+        self.statusBar().showMessage(message)
+        QMessageBox.information(self, "Test", message)
+
+    @Slot(str)
+    def _on_test_failed(self, message: str) -> None:
+        self._set_test_busy(False)
+        self.statusBar().showMessage("Connection test failed.")
+        QMessageBox.warning(self, "Test", message)
+
+    def _cleanup_test_worker(self) -> None:
+        thread = self._test_thread
+        worker = self._test_worker
+        self._test_thread = None
+        self._test_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+
     def _apply_application_name(self) -> None:
         """Set the title bar and the Qt application name from window.title.
 
@@ -377,6 +509,9 @@ class SettingsWindow(QMainWindow):
         self.api_key_edit.setEchoMode(mode)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 — Qt API
+        if self._test_thread is not None and self._test_thread.isRunning():
+            self._test_thread.quit()
+            self._test_thread.wait(2000)
         super().closeEvent(event)
 
 

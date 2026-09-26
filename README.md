@@ -2,7 +2,7 @@
 
 This repository is a starting point for a native Windows desktop app that talks to an OpenAI-compatible API. It is not a finished product.
 
-The window shows only the connection form at the top. **Reload** and **Save** stay inside that form. The space under it is empty on purpose. Add the rest of the product there.
+The window shows only the connection form at the top. **Reload**, **Save**, and **Test** stay inside that form. The space under it is empty on purpose. Add the rest of the product there.
 
 The application name, icon, window size, and taskbar identity are set only in `config.json`. They are not on the form and cannot be changed from the interface.
 
@@ -18,9 +18,11 @@ Dependencies:
 - `openai` (Apache-2.0) — OpenAI-compatible API client
 - `PySide6` (LGPL-3.0) — native Windows UI
 
-## What Save and Reload do
+## What Reload, Save, and Test do
 
 On startup the form reads `config.json`.
+
+**Reload** throws away unsaved form edits, reads the file again, and refreshes the form, the icon, and the application name.
 
 **Save** writes the four form fields back to the file:
 
@@ -31,11 +33,11 @@ On startup the form reads `config.json`.
 
 Everything else in `config.json` is kept from the copy already in memory, including `window.title`, `window.icon`, size, and `app_user_model_id`.
 
-**Reload** throws away unsaved form edits, reads the file again, and refreshes the form, the icon, and the application name.
+**Test** does not write the file. It uses the values currently on the form. First it rejects empty placeholders (`YOUR_API_KEY`, `YOUR_BASE_URL`, `YOUR_AGENT_NAME`). Then it asks the gateway if those settings can connect. The request runs off the UI thread so the window stays responsive.
 
 If you edit `config.json` on disk while the window is open, press **Reload** before **Save**. Otherwise Save overwrites the file with the older in-memory copy.
 
-Placeholder values such as `YOUR_API_KEY` are saved as written. The form does not call the API, so it does not treat them as errors.
+Placeholder values such as `YOUR_API_KEY` are saved as written. **Save** does not treat them as errors. **Test** does.
 
 ## Form fields
 
