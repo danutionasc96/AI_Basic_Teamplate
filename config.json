@@ -1,0 +1,13 @@
+{
+  "api_key": "YOUR_API_KEY",
+  "base_url": "YOUR_BASE_URL",
+  "model": "YOUR_AGENT_NAME",
+  "timeout_seconds": 90,
+  "window": {
+    "title": "AI Connection",
+    "width": 480,
+    "height": 320,
+    "icon": "assets/icon.png",
+    "app_user_model_id": "template.ai.connection"
+  }
+}
